@@ -1,0 +1,5 @@
+monitor_data/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

@@ -12,6 +12,8 @@ param(
     [int]$AutoRecoverySamples = 3,
     [ValidateRange(1, 60)]
     [int]$AutoRecoveryIntervalSeconds = 1,
+    [ValidateRange(5, 300)]
+    [int]$ScanTimeoutSeconds = 45,
     [switch]$DisableAutoRecovery,
     [switch]$Once,
     [switch]$SelfTest,
@@ -21,7 +23,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$Script:Version = '0.4.2-beta'
+$Script:Version = '0.4.3-beta'
 $Script:NotifyIcon = $null
 $Script:StableState = $null
 $Script:StableFingerprint = ''
@@ -44,6 +46,9 @@ $Script:PendingSwitch = $null
 $Script:PendingRepair = $null
 $Script:LastReport = $null
 $Script:AsyncScan = $null
+$Script:LastScanError = ''
+$Script:LastScanErrorAt = $null
+$Script:MonitorScanTimeoutSeconds = $ScanTimeoutSeconds
 $Script:AsyncDirectProbe = $null
 $Script:AsyncSystemProxyRestoreProbe = $null
 $Script:PendingSystemProxyRestore = $null
@@ -1006,18 +1011,38 @@ function Submit-OwnershipReport {
 }
 
 function Start-AsyncMonitorScan {
+    param([switch]$SkipPathHealth)
     if ($null -ne $Script:AsyncScan) { return }
     $escapedScanner = $ScannerPath.Replace("'", "''")
     $escapedAdapter = $AdapterPath.Replace("'", "''")
     $scriptText = "& '$escapedScanner' -AdapterPath '$escapedAdapter' -PassThru -NoWriteReport -Quiet"
+    if ($SkipPathHealth) { $scriptText += ' -SkipPathHealth' }
     $powerShell = [PowerShell]::Create()
     [void]$powerShell.AddScript($scriptText)
     $async = $powerShell.BeginInvoke()
-    $Script:AsyncScan = [pscustomobject]@{ PowerShell=$powerShell; Async=$async; StartedAt=Get-Date }
+    $Script:AsyncScan = [pscustomobject]@{
+        PowerShell = $powerShell
+        Async = $async
+        StartedAt = Get-Date
+        Mode = $(if($SkipPathHealth){'Quick'}else{'Full'})
+    }
 }
 
 function Complete-AsyncMonitorScan {
-    if ($null -eq $Script:AsyncScan -or -not $Script:AsyncScan.Async.IsCompleted) { return $false }
+    if ($null -eq $Script:AsyncScan) { return $false }
+    if (-not $Script:AsyncScan.Async.IsCompleted) {
+        $elapsedSeconds = ((Get-Date) - $Script:AsyncScan.StartedAt).TotalSeconds
+        if ($elapsedSeconds -lt $Script:MonitorScanTimeoutSeconds) { return $false }
+
+        $timedOutScan = $Script:AsyncScan
+        $Script:AsyncScan = $null
+        $Script:LastScanError = "网络状态检查超过 $($Script:MonitorScanTimeoutSeconds) 秒，已中止并准备重试。"
+        $Script:LastScanErrorAt = Get-Date
+        try { $timedOutScan.PowerShell.Stop() } catch {}
+        try { $timedOutScan.PowerShell.Dispose() } catch {}
+        Write-MonitorLog -Level 'ERROR' -Message $Script:LastScanError
+        return $false
+    }
     $scan = $Script:AsyncScan
     $Script:AsyncScan = $null
     try {
@@ -1029,7 +1054,14 @@ function Complete-AsyncMonitorScan {
         $report = @($output | Where-Object { $null -ne $_ -and $_.PSObject.Properties.Name -contains 'summary' }) | Select-Object -Last 1
         if ($null -eq $report) { throw '异步扫描没有返回结构化报告。' }
         [void](Submit-OwnershipReport -Report $report)
+        $Script:LastScanError = ''
+        $Script:LastScanErrorAt = $null
         return $true
+    }
+    catch {
+        $Script:LastScanError = $_.Exception.Message
+        $Script:LastScanErrorAt = Get-Date
+        throw
     }
     finally { $scan.PowerShell.Dispose() }
 }
@@ -1268,12 +1300,23 @@ function Get-NetworkStatusDialogModel {
         '如果你不确定应该关闭哪个客户端，建议一键退出全部代理并恢复普通网络；确认网页能打开后，只重新打开一个代理客户端。'
     }
     else { [string]$State.diagnosisAction }
+    $portOwnerText = if (@($State.portOwners).Count -gt 0) {
+        @($State.portOwners | ForEach-Object {
+            $clientName = if ([string]::IsNullOrWhiteSpace([string]$_.client)) { '未识别客户端' } else { [string]$_.client }
+            $processName = if ([string]::IsNullOrWhiteSpace([string]$_.process)) { '未知进程' } else { [string]$_.process }
+            "$($_.port) → $clientName（$processName）"
+        } | Sort-Object -Unique) -join '；'
+    }
+    else { '未发现已识别的代理端口' }
+    $coreOwnerText = if (@($State.coreClients).Count -gt 0) { @($State.coreClients | Sort-Object -Unique) -join '、' } else { '未发现已识别的后台 Core' }
     $statusRows = @(
         [pscustomobject]@{ Name='当前主要代理'; Value=[string]$State.effectiveOwner }
         [pscustomobject]@{ Name='诊断结果'; Value=[string]$State.diagnosisTitle }
         [pscustomobject]@{ Name='Windows 代理'; Value=$(if($State.systemProxyEnabled){'已开启'}else{'已关闭'}) }
         [pscustomobject]@{ Name='Windows 代理来自'; Value=$(if($State.systemProxyOwner){[string]$State.systemProxyOwner}else{'未识别或没有使用'}) }
         [pscustomobject]@{ Name='Windows 代理地址'; Value=$(if($State.systemProxyServer){[string]$State.systemProxyServer}else{'未设置'}) }
+        [pscustomobject]@{ Name='本地代理端口归属'; Value=$portOwnerText }
+        [pscustomobject]@{ Name='后台 Core 归属'; Value=$coreOwnerText }
         [pscustomobject]@{ Name='虚拟网卡代理（TUN）'; Value=$(if(@($State.tunOwners).Count){$State.tunOwners -join '、'}else{'未发现'}) }
         [pscustomobject]@{ Name='代理联网'; Value=(Convert-HealthStatusForDisplay $State.proxyStatus) }
         [pscustomobject]@{ Name='绕过系统代理'; Value=(Convert-HealthStatusForDisplay $State.directStatus) }
@@ -1651,7 +1694,7 @@ function Invoke-MonitorSelfTest {
         systemProxyServer = '127.0.0.1:7890'; systemProxyOwner = 'Clash Verge'; systemProxyOwnerId = 'clash_verge'; tunOwners = @()
         tunOwnerIds = @(); systemProxyIsLocal = $true; staleSystemProxy = $false; conflictCount = 0; conflicts = @(); coreClients = @('Clash Verge'); proxyGuardClients = @(); warningCount = 0
         diagnosisCode='HealthySingleOwner'; diagnosisTitle='代理接管正常'; diagnosisMessage='正常'; diagnosisAction='无需操作'; diagnosisOwnerIds=@('clash_verge'); diagnosisFindings=@()
-        directStatus='Healthy'; directHealthy=$true; proxyStatus='Healthy'; proxyHealthy=$true; proxyFailureCandidate=$false; environmentProxyStatus='NotTested'; environmentProxyHealthy=$false; environmentProxyEndpoint=''; environmentProxyFailureCandidate=$false; dnsStatus='Healthy'; portOwners=@(); environmentProxies=@()
+        directStatus='Healthy'; directHealthy=$true; proxyStatus='Healthy'; proxyHealthy=$true; proxyFailureCandidate=$false; environmentProxyStatus='NotTested'; environmentProxyHealthy=$false; environmentProxyEndpoint=''; environmentProxyFailureCandidate=$false; dnsStatus='Healthy'; portOwners=@([pscustomobject]@{clientId='clash_verge';client='Clash Verge';port=7890;pid=1234;process='verge-mihomo';startTimeUtc='2026-07-18T12:00:00Z';uiRunning=$true}); environmentProxies=@()
     }
     $conflict = [pscustomobject]@{
         observedAt = (Get-Date).ToString('o'); effectiveOwner = '多 Owner 冲突：Clash Verge、龙猫云 Lite'; systemProxyEnabled = $true
@@ -1664,7 +1707,9 @@ function Invoke-MonitorSelfTest {
     }
     $healthyStatusModel = Get-NetworkStatusDialogModel -State $base
     if ($healthyStatusModel.HasRisk -or $healthyStatusModel.CloseButtonText -ne '关闭') { throw '无冲突状态窗口仍显示修复入口。' }
-    if (@($healthyStatusModel.StatusRows).Count -ne 9 -or @($healthyStatusModel.StatusRows | Where-Object { $_.Name -eq 'Windows 代理地址' -and $_.Value -eq '127.0.0.1:7890' }).Count -ne 1) { throw '网络状态没有生成清晰的项目列表。' }
+    if (@($healthyStatusModel.StatusRows).Count -ne 11 -or @($healthyStatusModel.StatusRows | Where-Object { $_.Name -eq 'Windows 代理地址' -and $_.Value -eq '127.0.0.1:7890' }).Count -ne 1) { throw '网络状态没有生成清晰的项目列表。' }
+    if (@($healthyStatusModel.StatusRows | Where-Object { $_.Name -eq '本地代理端口归属' -and $_.Value -like '*7890*Clash Verge*verge-mihomo*' }).Count -ne 1) { throw '网络状态没有显示代理端口的客户端归属。' }
+    if (@($healthyStatusModel.StatusRows | Where-Object { $_.Name -eq '后台 Core 归属' -and $_.Value -eq 'Clash Verge' }).Count -ne 1) { throw '网络状态没有显示后台 Core 的客户端归属。' }
     $conflictStatusModel = Get-NetworkStatusDialogModel -State $conflict
     if (-not $conflictStatusModel.HasRisk -or $conflictStatusModel.RepairButtonText -ne '退出全部代理并恢复普通网络') { throw '冲突状态窗口缺少一键解决入口。' }
     if ($conflictStatusModel.Body -notlike '*1. 高风险：系统代理属于 Clash Verge，TUN 属于龙猫云 Lite*' -or $conflictStatusModel.Body -notmatch "`r`n" -or $conflictStatusModel.CloseButtonText -ne '暂不处理') { throw '冲突详情列表或暂不处理入口文案错误。' }
@@ -1776,19 +1821,21 @@ Start-Sleep -Milliseconds 1200
     $heartbeatTimer = $null
     try {
         @'
-param([string]$AdapterPath, [switch]$PassThru, [switch]$NoWriteReport, [switch]$Quiet)
-Start-Sleep -Milliseconds 1500
+param([string]$AdapterPath, [switch]$PassThru, [switch]$NoWriteReport, [switch]$Quiet, [switch]$SkipPathHealth)
+Start-Sleep -Milliseconds 5000
 [pscustomobject]@{ summary='slow-test' }
 '@ | Set-Content -LiteralPath $slowScannerScript -Encoding UTF8
         $Script:ScannerPath = $slowScannerScript
         $Script:AsyncScan = $null
+        $originalScanTimeoutSeconds = $Script:MonitorScanTimeoutSeconds
+        $Script:MonitorScanTimeoutSeconds = 1
         Add-Type -AssemblyName System.Windows.Forms
         $Script:SelfTestUiHeartbeat = 0
         $heartbeatTimer = New-Object System.Windows.Forms.Timer
         $heartbeatTimer.Interval = 50
         $heartbeatTimer.add_Tick({ $Script:SelfTestUiHeartbeat++ })
         $stopwatch = [Diagnostics.Stopwatch]::StartNew()
-        Start-AsyncMonitorScan
+        Start-AsyncMonitorScan -SkipPathHealth
         $startElapsed = $stopwatch.ElapsedMilliseconds
         $heartbeatTimer.Start()
         while ($stopwatch.ElapsedMilliseconds -lt 700) {
@@ -1796,9 +1843,15 @@ Start-Sleep -Milliseconds 1500
             Start-Sleep -Milliseconds 10
         }
         $heartbeatTimer.Stop()
-        $stopwatch.Stop()
         if ($startElapsed -ge 500) { throw "后台完整扫描启动阻塞 UI：${startElapsed}ms。" }
         if ($Script:SelfTestUiHeartbeat -lt 5) { throw "慢网络扫描期间 UI 心跳不足：$($Script:SelfTestUiHeartbeat)。" }
+        while ($stopwatch.ElapsedMilliseconds -lt 1200) {
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 10
+        }
+        $stopwatch.Stop()
+        if (Complete-AsyncMonitorScan) { throw '超时的后台扫描被错误标记为完成。' }
+        if ($null -ne $Script:AsyncScan -or $Script:LastScanError -notlike '*超过 1 秒*') { throw '后台扫描超时没有正确释放或记录错误。' }
     }
     finally {
         if ($null -ne $heartbeatTimer) { try { $heartbeatTimer.Stop(); $heartbeatTimer.Dispose() } catch {} }
@@ -1808,6 +1861,7 @@ Start-Sleep -Milliseconds 1500
             $Script:AsyncScan = $null
         }
         $Script:ScannerPath = $originalScannerPath
+        $Script:MonitorScanTimeoutSeconds = $originalScanTimeoutSeconds
         Remove-Item -LiteralPath $slowScannerScript -Force -ErrorAction SilentlyContinue
     }
     $upstream = $base.PSObject.Copy()
@@ -1888,7 +1942,12 @@ function Start-TrayMonitor {
         $menu.add_Opening({
             try {
                 if ($null -eq $Script:StableState) {
-                    $statusItem.Text = '网络状态：正在检查'
+                    if (-not [string]::IsNullOrWhiteSpace($Script:LastScanError)) {
+                        $statusItem.Text = '网络状态：检查失败（点此查看）'
+                    }
+                    else {
+                        $statusItem.Text = '网络状态：正在检查'
+                    }
                 }
                 elseif ($Script:UpstreamNotified) {
                     $statusItem.Text = '网络状态：代理线路持续异常'
@@ -1915,7 +1974,14 @@ function Start-TrayMonitor {
 
         $statusItem.add_Click({
             Invoke-TrayActionSafely -ActionName '查看网络状态' -Action {
-                if ($null -eq $Script:StableState) { return }
+                if ($null -eq $Script:StableState) {
+                    $message = if (-not [string]::IsNullOrWhiteSpace($Script:LastScanError)) {
+                        "暂时无法完成网络状态检查。`r`n`r`n$($Script:LastScanError)`r`n`r`n程序会在后台自动重试。"
+                    }
+                    else { '正在读取系统代理、端口和后台核心，请稍后再试。' }
+                    [System.Windows.Forms.MessageBox]::Show($message, '断网急救', 'OK', 'Information') | Out-Null
+                    return
+                }
                 if ((Show-NetworkStatusDialog -State $Script:StableState) -eq 'Repair') {
                     Invoke-EmergencyCleanupFromTray
                 }
@@ -1963,7 +2029,11 @@ function Start-TrayMonitor {
                     $Script:NextFullScanAt = (Get-Date).AddSeconds($IntervalSeconds)
                 }
             }
-            catch { Write-MonitorLog -Level 'ERROR' -Message "后台扫描失败：$($_.Exception.Message)" }
+            catch {
+                $Script:LastScanError = $_.Exception.Message
+                $Script:LastScanErrorAt = Get-Date
+                Write-MonitorLog -Level 'ERROR' -Message "后台扫描失败：$($_.Exception.Message)"
+            }
         })
 
         $autoRecoveryTimer = New-Object System.Windows.Forms.Timer
@@ -1978,7 +2048,7 @@ function Start-TrayMonitor {
         })
 
         Write-MonitorLog -Level 'INFO' -Message "后台监控 v$Script:Version 已启动，完整扫描间隔 $IntervalSeconds 秒，状态确认 $ConfirmationSamples 次，自动急救=$(if($Script:AutoRecoveryEnabled){'开启'}else{'关闭'})，轻量检查间隔 $AutoRecoveryIntervalSeconds 秒，失效代理确认 $AutoRecoverySamples 次。"
-        Start-AsyncMonitorScan
+        Start-AsyncMonitorScan -SkipPathHealth
         $Script:NextFullScanAt = (Get-Date).AddSeconds($IntervalSeconds)
         $timer.Start()
         $autoRecoveryTimer.Start()

@@ -1,0 +1,2 @@
+# Preserve Windows batch files byte-for-byte in GitHub source archives.
+*.bat binary

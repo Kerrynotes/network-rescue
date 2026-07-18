@@ -14,7 +14,8 @@ $defaultInstallDirectory = Join-Path $env:LOCALAPPDATA 'KerryNetworkRescue'
 if ([string]::IsNullOrWhiteSpace($InstallDirectory)) { $InstallDirectory = $defaultInstallDirectory }
 
 $startupDirectory = [Environment]::GetFolderPath('Startup')
-$shortcutPath = Join-Path $startupDirectory '断网急救.lnk'
+$shortcutPath = Join-Path $startupDirectory 'Network Rescue.lnk'
+$legacyShortcutPath = Join-Path $startupDirectory '断网急救.lnk'
 $watcherPath = Join-Path $InstallDirectory 'Watch-NetworkOwnership.ps1'
 $dataDirectory = Join-Path $InstallDirectory 'monitor_data'
 $stopFlagPath = Join-Path $dataDirectory 'stop.request'
@@ -30,10 +31,11 @@ function New-StartupShortcut {
 }
 
 function Test-StartupShortcutTargetsWatcher {
-    if (-not (Test-Path -LiteralPath $shortcutPath)) { return $false }
+    param([string]$Path = $shortcutPath)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
     try {
         $shell = New-Object -ComObject WScript.Shell
-        $shortcut = $shell.CreateShortcut($shortcutPath)
+        $shortcut = $shell.CreateShortcut($Path)
         return ([string]$shortcut.Arguments -like "*$watcherPath*")
     }
     catch { return $false }
@@ -76,9 +78,9 @@ switch ($Mode) {
         $files = @(
             'Scan-NetworkOwnership.ps1', 'Watch-NetworkOwnership.ps1', 'Repair-Network.ps1', 'Test-NetworkPathHealth.ps1',
             'Install-NetworkRescue.ps1', 'Install-NetworkRescueHelper.ps1', 'Invoke-NetworkRescueHelper.ps1',
-            'client_adapters.json', 'README.md', '使用说明_先看这里.txt', '更新日志.md', '发布说明_v0.4.2-beta.md',
-            '安装断网急救.bat', '启动断网急救.bat', '查看代理连接记录.bat', '卸载断网急救.bat',
-            '安装高权限Helper_仅需一次UAC.bat', '卸载高权限Helper.bat'
+            'client_adapters.json', 'README.md', '使用说明_先看这里.txt', '更新日志.md', '发布说明_v0.4.3-beta.md',
+            'Install-NetworkRescue.bat', 'Start-NetworkRescue.bat', 'Open-Connection-Logs.bat', 'Uninstall-NetworkRescue.bat',
+            'Install-Privileged-Helper.bat', 'Uninstall-Privileged-Helper.bat'
         )
         foreach ($name in $files) {
             $source = Join-Path $PSScriptRoot $name
@@ -87,7 +89,9 @@ switch ($Mode) {
         foreach ($obsoleteName in @(
             '启动只读后台监控.bat', '扫描网络接管.bat', '一键恢复普通网络.bat', '停止断网急救后台监控.bat',
             '启动高权限Helper.bat', '停止高权限Helper.bat', '启动龙猫云断连监控.bat', '停止龙猫云断连监控.bat',
-            '查看龙猫云断连记录.bat', 'Monitor-LongmaoConnection.ps1'
+            '查看龙猫云断连记录.bat', 'Monitor-LongmaoConnection.ps1',
+            '安装断网急救.bat', '启动断网急救.bat', '查看代理连接记录.bat', '卸载断网急救.bat',
+            '安装高权限Helper_仅需一次UAC.bat', '卸载高权限Helper.bat'
         )) {
             $obsoletePath = Join-Path $InstallDirectory $obsoleteName
             if (Test-Path -LiteralPath $obsoletePath) { Remove-Item -LiteralPath $obsoletePath -Force -ErrorAction SilentlyContinue }
@@ -103,6 +107,7 @@ switch ($Mode) {
         }
         if (Test-Path -LiteralPath $stopFlagPath) { Remove-Item -LiteralPath $stopFlagPath -Force }
         if (-not $NoStartup) { New-StartupShortcut }
+        if (Test-StartupShortcutTargetsWatcher -Path $legacyShortcutPath) { Remove-Item -LiteralPath $legacyShortcutPath -Force }
         if (-not $NoLaunch) {
             Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File `"$watcherPath`"" -WindowStyle Hidden
         }
@@ -113,7 +118,8 @@ switch ($Mode) {
     'Uninstall' {
         Stop-RunningMonitor
         if (-not (Test-Path -LiteralPath $stopFlagPath)) { Set-Content -LiteralPath $stopFlagPath -Value (Get-Date -Format 'o') -Encoding UTF8 }
-        if (Test-StartupShortcutTargetsWatcher) { Remove-Item -LiteralPath $shortcutPath -Force }
+        if (Test-StartupShortcutTargetsWatcher -Path $shortcutPath) { Remove-Item -LiteralPath $shortcutPath -Force }
+        if (Test-StartupShortcutTargetsWatcher -Path $legacyShortcutPath) { Remove-Item -LiteralPath $legacyShortcutPath -Force }
         Write-Host '已移除开机启动项，并通知托盘监控退出。' -ForegroundColor Green
         Write-Host "安装目录、日志和备份仍保留在：$InstallDirectory"
     }

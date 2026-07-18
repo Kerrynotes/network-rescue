@@ -12,7 +12,7 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$Script:Version = '0.4.2-beta'
+$Script:Version = '0.4.3-beta'
 
 $Script:DirectTargets = @(
     'http://www.msftconnecttest.com/connecttest.txt',

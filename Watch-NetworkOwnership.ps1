@@ -21,7 +21,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$Script:Version = '0.4.0-beta'
+$Script:Version = '0.4.1-beta'
 $Script:NotifyIcon = $null
 $Script:StableState = $null
 $Script:StableFingerprint = ''
@@ -71,6 +71,9 @@ $Script:HelperClientPath = Join-Path (Split-Path -Parent $RepairPath) 'Invoke-Ne
 $Script:HelperInstallResultPath = Join-Path $DataDirectory 'helper-install-result.json'
 $Script:RepairResultPath = Join-Path $DataDirectory 'last-repair-result.json'
 $Script:PathHealthScript = Join-Path (Split-Path -Parent $ScannerPath) 'Test-NetworkPathHealth.ps1'
+$Script:LongmaoConnectionMonitorPath = Join-Path (Split-Path -Parent $ScannerPath) 'Monitor-LongmaoConnection.ps1'
+$Script:LongmaoConnectionDataDirectory = Join-Path (Split-Path -Parent $ScannerPath) 'monitor_data\longmao_connection'
+$Script:LongmaoConnectionStopFlagPath = Join-Path $Script:LongmaoConnectionDataDirectory 'stop.request'
 
 if (-not (Test-Path -LiteralPath $DataDirectory)) {
     New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
@@ -1732,6 +1735,49 @@ Start-Sleep -Milliseconds 1500
     finally { $Script:TestMode = $false }
 }
 
+function Get-LongmaoConnectionMonitorProcesses {
+    if (-not (Test-Path -LiteralPath $Script:LongmaoConnectionMonitorPath)) { return @() }
+    $escapedPath = [regex]::Escape($Script:LongmaoConnectionMonitorPath)
+    return @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { [string]$_.CommandLine -match $escapedPath })
+}
+
+function Test-LongmaoCoreRunning {
+    return @(
+        Get-Process -Name 'lmclientCore' -ErrorAction SilentlyContinue
+    ).Count -gt 0
+}
+
+function Start-LongmaoConnectionMonitorIfNeeded {
+    # 只有检测到龙猫云核心时才启动，避免未使用龙猫云的用户产生无意义的断连记录。
+    if (-not (Test-LongmaoCoreRunning)) { return }
+    if (@(Get-LongmaoConnectionMonitorProcesses).Count -gt 0) { return }
+    if (Test-Path -LiteralPath $Script:LongmaoConnectionStopFlagPath) {
+        Remove-Item -LiteralPath $Script:LongmaoConnectionStopFlagPath -Force -ErrorAction SilentlyContinue
+    }
+    Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($Script:LongmaoConnectionMonitorPath)`"" -WindowStyle Hidden
+    Write-MonitorLog -Level 'INFO' -Message '检测到龙猫云核心，已自动启动断连监控。'
+}
+
+function Stop-LongmaoConnectionMonitor {
+    $running = @(Get-LongmaoConnectionMonitorProcesses)
+    if ($running.Count -eq 0) { return }
+    if (-not (Test-Path -LiteralPath $Script:LongmaoConnectionDataDirectory)) {
+        New-Item -ItemType Directory -Path $Script:LongmaoConnectionDataDirectory -Force | Out-Null
+    }
+    Set-Content -LiteralPath $Script:LongmaoConnectionStopFlagPath -Value (Get-Date -Format 'o') -Encoding UTF8
+    $deadline = (Get-Date).AddSeconds(8)
+    do {
+        Start-Sleep -Milliseconds 250
+        $running = @(Get-LongmaoConnectionMonitorProcesses)
+    } while ($running.Count -gt 0 -and (Get-Date) -lt $deadline)
+    if ($running.Count -gt 0) {
+        foreach ($process in $running) {
+            Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Start-TrayMonitor {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -1745,6 +1791,7 @@ function Start-TrayMonitor {
 
     try {
         if (Test-Path -LiteralPath $Script:StopFlagPath) { Remove-Item -LiteralPath $Script:StopFlagPath -Force }
+        Start-LongmaoConnectionMonitorIfNeeded
         $context = New-Object System.Windows.Forms.ApplicationContext
         $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
         $Script:NotifyIcon = $notifyIcon
@@ -1827,7 +1874,7 @@ function Start-TrayMonitor {
         })
         $exitItem.add_Click({
             Invoke-TrayActionSafely -ActionName '退出断网急救' -Action {
-                if (Confirm-RepairAction '退出断网急救' '退出后将停止本次后台检查和断网自动恢复；下次登录 Windows 时仍会按开机启动设置运行。是否退出？') {
+                if (Confirm-RepairAction '退出断网急救' '退出后将停止本次后台检查、断网自动恢复和龙猫云断连监控；下次登录 Windows 时仍会按开机启动设置运行。是否退出？') {
                     $notifyIcon.Visible = $false
                     $context.ExitThread()
                 }
@@ -1846,6 +1893,7 @@ function Start-TrayMonitor {
             }
             try {
                 [void](Complete-AsyncMonitorScan)
+                Start-LongmaoConnectionMonitorIfNeeded
                 if ($null -eq $Script:AsyncScan -and (Get-Date) -ge $Script:NextFullScanAt) {
                     Start-AsyncMonitorScan
                     $Script:NextFullScanAt = (Get-Date).AddSeconds($IntervalSeconds)
@@ -1891,6 +1939,7 @@ function Start-TrayMonitor {
         $notifyIcon.Dispose()
     }
     finally {
+        Stop-LongmaoConnectionMonitor
         $Script:NotifyIcon = $null
         try { $mutex.ReleaseMutex() } catch {}
         $mutex.Dispose()

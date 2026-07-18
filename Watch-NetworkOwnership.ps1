@@ -1893,8 +1893,8 @@ function Start-TrayMonitor {
             }
             try {
                 [void](Complete-AsyncMonitorScan)
-                Start-LongmaoConnectionMonitorIfNeeded
                 if ($null -eq $Script:AsyncScan -and (Get-Date) -ge $Script:NextFullScanAt) {
+                    Start-LongmaoConnectionMonitorIfNeeded
                     Start-AsyncMonitorScan
                     $Script:NextFullScanAt = (Get-Date).AddSeconds($IntervalSeconds)
                 }

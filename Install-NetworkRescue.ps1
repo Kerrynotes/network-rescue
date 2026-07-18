@@ -76,14 +76,21 @@ switch ($Mode) {
         $files = @(
             'Scan-NetworkOwnership.ps1', 'Watch-NetworkOwnership.ps1', 'Repair-Network.ps1', 'Test-NetworkPathHealth.ps1',
             'Install-NetworkRescue.ps1', 'Install-NetworkRescueHelper.ps1', 'Invoke-NetworkRescueHelper.ps1',
-            'client_adapters.json', 'README.md', '使用说明_先看这里.txt', '更新日志.md', '发布说明_v0.4.1-beta.md',
-            'Monitor-LongmaoConnection.ps1',
-            '安装断网急救.bat', '启动断网急救.bat', '查看龙猫云断连记录.bat', '卸载断网急救.bat',
+            'client_adapters.json', 'README.md', '使用说明_先看这里.txt', '更新日志.md', '发布说明_v0.4.2-beta.md',
+            '安装断网急救.bat', '启动断网急救.bat', '查看代理连接记录.bat', '卸载断网急救.bat',
             '安装高权限Helper_仅需一次UAC.bat', '卸载高权限Helper.bat'
         )
         foreach ($name in $files) {
             $source = Join-Path $PSScriptRoot $name
             if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination (Join-Path $InstallDirectory $name) -Force }
+        }
+        foreach ($obsoleteName in @(
+            '启动只读后台监控.bat', '扫描网络接管.bat', '一键恢复普通网络.bat', '停止断网急救后台监控.bat',
+            '启动高权限Helper.bat', '停止高权限Helper.bat', '启动龙猫云断连监控.bat', '停止龙猫云断连监控.bat',
+            '查看龙猫云断连记录.bat', 'Monitor-LongmaoConnection.ps1'
+        )) {
+            $obsoletePath = Join-Path $InstallDirectory $obsoleteName
+            if (Test-Path -LiteralPath $obsoletePath) { Remove-Item -LiteralPath $obsoletePath -Force -ErrorAction SilentlyContinue }
         }
         $helperSource = Join-Path $PSScriptRoot 'helper'
         $helperTarget = Join-Path $InstallDirectory 'helper'

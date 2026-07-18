@@ -21,7 +21,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$Script:Version = '0.4.1-beta'
+$Script:Version = '0.4.2-beta'
 $Script:NotifyIcon = $null
 $Script:StableState = $null
 $Script:StableFingerprint = ''
@@ -32,6 +32,10 @@ $Script:AutoRecoveryEnabled = -not $DisableAutoRecovery
 $Script:StaleProxyServer = ''
 $Script:StaleProxyCount = 0
 $Script:UpstreamFailureSince = $null
+$Script:UpstreamFailureType = ''
+$Script:UpstreamFailureTitle = ''
+$Script:UpstreamFailureReason = ''
+$Script:UpstreamFailureEndpoint = ''
 $Script:UpstreamEventStarted = $false
 $Script:UpstreamNotified = $false
 $Script:UpstreamRecoveryCount = 0
@@ -71,9 +75,9 @@ $Script:HelperClientPath = Join-Path (Split-Path -Parent $RepairPath) 'Invoke-Ne
 $Script:HelperInstallResultPath = Join-Path $DataDirectory 'helper-install-result.json'
 $Script:RepairResultPath = Join-Path $DataDirectory 'last-repair-result.json'
 $Script:PathHealthScript = Join-Path (Split-Path -Parent $ScannerPath) 'Test-NetworkPathHealth.ps1'
-$Script:LongmaoConnectionMonitorPath = Join-Path (Split-Path -Parent $ScannerPath) 'Monitor-LongmaoConnection.ps1'
-$Script:LongmaoConnectionDataDirectory = Join-Path (Split-Path -Parent $ScannerPath) 'monitor_data\longmao_connection'
-$Script:LongmaoConnectionStopFlagPath = Join-Path $Script:LongmaoConnectionDataDirectory 'stop.request'
+$Script:ConnectionHistoryPath = Join-Path $DataDirectory '代理连接记录.csv'
+$Script:ConnectionHistoryRetentionDays = 180
+$Script:ConnectionHistoryMaxRecords = 5000
 
 if (-not (Test-Path -LiteralPath $DataDirectory)) {
     New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
@@ -217,6 +221,12 @@ function Get-RelevantState {
         proxyStatus = if ($null -ne $pathHealth) { [string]$pathHealth.proxy.status } else { 'NotTested' }
         proxyHealthy = if ($null -ne $pathHealth) { [bool]$pathHealth.proxy.healthy } else { $false }
         proxyFailureCandidate = if ($null -ne $pathHealth) { [bool]$pathHealth.proxyFailureCandidate } else { $false }
+        environmentProxyStatus = if ($null -ne $pathHealth) { [string]$pathHealth.environmentProxy.status } else { 'NotTested' }
+        environmentProxyHealthy = if ($null -ne $pathHealth) { [bool]$pathHealth.environmentProxy.healthy } else { $false }
+        environmentProxyEndpoint = if ($null -ne $pathHealth) { [string]$pathHealth.environmentProxy.endpoint } else { '' }
+        environmentProxyFailureCandidate = if ($null -ne $pathHealth) {
+            [bool]$pathHealth.environmentProxy.configured -and $pathHealth.environmentProxy.status -in @('Failed','Degraded') -and [bool]$pathHealth.direct.healthy
+        } else { $false }
         dnsStatus = if ($null -ne $pathHealth) { [string]$pathHealth.dns.status } else { 'NotTested' }
         portOwners = $portOwners
         environmentProxies = $environmentProxies
@@ -347,6 +357,46 @@ function Write-StructuredEvent {
     Write-MonitorLog -Level 'EVENT' -Message "$Title：$Message"
 }
 
+function Add-ConnectionHistoryRecord {
+    param(
+        [string]$EventType,
+        [string]$Owner,
+        [string]$Endpoint,
+        [string]$Reason,
+        [double]$DurationSeconds = -1
+    )
+    if ($Script:TestMode) { return }
+    $row = [pscustomobject][ordered]@{
+        '时间' = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        '事件' = $EventType
+        '当前代理' = $Owner
+        '代理地址' = $Endpoint
+        '持续秒数' = if ($DurationSeconds -ge 0) { [math]::Round($DurationSeconds, 1) } else { '' }
+        '原因' = $Reason
+    }
+    $csvLines = @($row | ConvertTo-Csv -NoTypeInformation)
+    if (-not (Test-Path -LiteralPath $Script:ConnectionHistoryPath)) {
+        [void](Add-ContentWithRetry -Path $Script:ConnectionHistoryPath -Value $csvLines[0] -MaxBytes $Script:EventMaxBytes -ArchiveCount $Script:ArchiveCount)
+    }
+    [void](Add-ContentWithRetry -Path $Script:ConnectionHistoryPath -Value $csvLines[1] -MaxBytes $Script:EventMaxBytes -ArchiveCount $Script:ArchiveCount)
+    try {
+        $cutoff = (Get-Date).AddDays(-$Script:ConnectionHistoryRetentionDays)
+        $records = @(
+            Import-Csv -LiteralPath $Script:ConnectionHistoryPath -Encoding UTF8 |
+            Where-Object {
+                $timestamp = [datetime]::MinValue
+                [datetime]::TryParse([string]$_.'时间', [ref]$timestamp) -and $timestamp -ge $cutoff
+            } |
+            Select-Object -Last $Script:ConnectionHistoryMaxRecords
+        )
+        $retainedLines = if ($records.Count -gt 0) { @($records | ConvertTo-Csv -NoTypeInformation) } else { @($csvLines[0]) }
+        [void](Set-ContentWithRetry -Path $Script:ConnectionHistoryPath -Value ($retainedLines -join [Environment]::NewLine))
+    }
+    catch {
+        Write-MonitorLog -Level 'WARN' -Message "整理代理连接记录失败：$($_.Exception.Message)"
+    }
+}
+
 function Write-NewDiagnosisEvents {
     param($OldState, $NewState)
     $oldCodes = @($OldState.diagnosisFindings | Select-Object -ExpandProperty code -Unique)
@@ -414,6 +464,10 @@ function Set-TrayAppearance {
 
 function Reset-UpstreamHealthState {
     $Script:UpstreamFailureSince = $null
+    $Script:UpstreamFailureType = ''
+    $Script:UpstreamFailureTitle = ''
+    $Script:UpstreamFailureReason = ''
+    $Script:UpstreamFailureEndpoint = ''
     $Script:UpstreamEventStarted = $false
     $Script:UpstreamNotified = $false
     $Script:UpstreamRecoveryCount = 0
@@ -422,25 +476,53 @@ function Reset-UpstreamHealthState {
 
 function Update-UpstreamHealth {
     param($State)
+    $failure = $null
     if ($State.proxyFailureCandidate) {
-        $Script:UpstreamRecoveryCount = 0
-        if ($null -eq $Script:UpstreamFailureSince) {
-            $Script:UpstreamFailureSince = Get-Date
-            Write-MonitorLog -Level 'WARN' -Message '多个代理探测目标失败，开始观察；30 秒内不弹窗，避免短时抖动打扰。'
+        $failure = [pscustomobject]@{
+            Type='SystemProxy'; Title='代理线路故障已确认'; Owner=$State.effectiveOwner; Endpoint=$State.systemProxyServer
+            Reason='本地代理端口仍在监听，但多个代理联网目标持续失败。'; CanRestoreDirect=$true
         }
+    }
+    elseif ($State.environmentProxyFailureCandidate) {
+        $failure = [pscustomobject]@{
+            Type='ApplicationProxy'; Title='应用代理连接异常'; Owner=$State.effectiveOwner; Endpoint=$State.environmentProxyEndpoint
+            Reason='应用仍通过本地代理联网，但多个代理联网目标持续失败。'; CanRestoreDirect=$true
+        }
+    }
+    elseif ($State.directStatus -eq 'Failed') {
+        $isTun = @($State.tunOwnerIds).Count -gt 0
+        $failure = [pscustomobject]@{
+            Type=$(if($isTun){'TunOrLocal'}else{'LocalNetwork'}); Title=$(if($isTun){'TUN 或本地网络连接异常'}else{'普通网络连接异常'})
+            Owner=$(if($isTun){$State.effectiveOwner}else{'普通网络'}); Endpoint=''
+            Reason=$(if($isTun){'当前 TUN 接管路径下普通联网失败，可能是 TUN 或本地网络异常。'}else{'绕过代理的普通联网失败。'}); CanRestoreDirect=$false
+        }
+    }
+
+    if ($null -ne $failure) {
+        $Script:UpstreamRecoveryCount = 0
+        $newFailure = $null -eq $Script:UpstreamFailureSince -or (-not [string]::IsNullOrWhiteSpace($Script:UpstreamFailureType) -and $Script:UpstreamFailureType -ne $failure.Type)
+        if ($newFailure) {
+            Reset-UpstreamHealthState
+            $Script:UpstreamFailureSince = Get-Date
+            Write-MonitorLog -Level 'WARN' -Message "$($failure.Title)：开始观察；30 秒内不弹窗，避免短时抖动打扰。"
+        }
+        $Script:UpstreamFailureType = $failure.Type
+        $Script:UpstreamFailureTitle = $failure.Title
+        $Script:UpstreamFailureReason = $failure.Reason
+        $Script:UpstreamFailureEndpoint = $failure.Endpoint
         $elapsedSeconds = [int]((Get-Date) - $Script:UpstreamFailureSince).TotalSeconds
         if ($elapsedSeconds -ge 60 -and -not $Script:UpstreamEventStarted) {
             $Script:UpstreamEventStarted = $true
-            Write-StructuredEvent -Type 'UpstreamOutageStarted' -Title '代理线路故障已确认' `
-                -Message '本地端口和普通网络正常，但多个代理联网目标持续失败；不会自动关闭代理。' `
-                -Data ([pscustomobject]@{ owner=$State.effectiveOwner; endpoint=$State.systemProxyServer; elapsedSeconds=$elapsedSeconds })
+            Write-StructuredEvent -Type "$($failure.Type)OutageStarted" -Title $failure.Title `
+                -Message $failure.Reason -Data ([pscustomobject]@{ owner=$failure.Owner; endpoint=$failure.Endpoint; elapsedSeconds=$elapsedSeconds; type=$failure.Type })
+            Add-ConnectionHistoryRecord -EventType '断连开始' -Owner $failure.Owner -Endpoint $failure.Endpoint -Reason $failure.Reason
         }
         if ($elapsedSeconds -ge 180 -and -not $Script:UpstreamNotified) {
             $Script:UpstreamNotified = $true
-            $Script:UpstreamActionAvailable = $true
+            $Script:UpstreamActionAvailable = [bool]$failure.CanRestoreDirect
             Show-MonitorNotification -Event ([pscustomobject]@{
-                Title='代理线路持续异常'
-                Text='本地代理仍在运行，但线路已连续失败约 3 分钟。请更新节点；点击此通知可选择恢复普通网络。'
+                Title=$failure.Title
+                Text=$(if($failure.CanRestoreDirect){'当前代理路径已连续异常约 3 分钟。请更新节点；点击此通知可选择恢复普通网络。'}else{'当前联网路径已连续异常约 3 分钟。请检查本地网络、TUN 或当前客户端。'})
                 Icon='Warning'
             })
         }
@@ -449,18 +531,29 @@ function Update-UpstreamHealth {
     }
 
     if ($null -eq $Script:UpstreamFailureSince) { return }
-    if ($State.proxyHealthy) {
+    $recovered = switch ($Script:UpstreamFailureType) {
+        'SystemProxy' { [bool]$State.proxyHealthy; break }
+        'ApplicationProxy' { [bool]$State.environmentProxyHealthy; break }
+        'TunOrLocal' { [bool]$State.directHealthy; break }
+        'LocalNetwork' { [bool]$State.directHealthy; break }
+        default { $false }
+    }
+    if ($recovered) {
         $Script:UpstreamRecoveryCount++
         if ($Script:UpstreamRecoveryCount -lt 2) { return }
         $duration = [math]::Round(((Get-Date) - $Script:UpstreamFailureSince).TotalSeconds, 1)
         if ($Script:UpstreamEventStarted) {
-            Write-StructuredEvent -Type 'UpstreamOutageRecovered' -Title '代理线路已恢复' `
-                -Message "代理联网连续两次恢复，故障持续约 $duration 秒。" `
-                -Data ([pscustomobject]@{ owner=$State.effectiveOwner; endpoint=$State.systemProxyServer; durationSeconds=$duration })
+            $recoveryTitle = if ([string]::IsNullOrWhiteSpace($Script:UpstreamFailureTitle)) { '网络连接已恢复' } else { "$($Script:UpstreamFailureTitle)已恢复" }
+            Write-StructuredEvent -Type "$($Script:UpstreamFailureType)OutageRecovered" -Title $recoveryTitle `
+                -Message "联网连续两次恢复，故障持续约 $duration 秒。" `
+                -Data ([pscustomobject]@{ owner=$State.effectiveOwner; endpoint=$Script:UpstreamFailureEndpoint; durationSeconds=$duration; type=$Script:UpstreamFailureType })
+            Add-ConnectionHistoryRecord -EventType '恢复连接' -Owner $State.effectiveOwner -Endpoint $Script:UpstreamFailureEndpoint `
+                -Reason '联网连续两次恢复。' -DurationSeconds $duration
         }
         $wasNotified = $Script:UpstreamNotified
+        $recoveryText = if ($Script:UpstreamFailureType -in @('SystemProxy','ApplicationProxy')) { "代理联网已恢复，之前的故障持续约 $duration 秒。" } else { "联网已恢复，之前的故障持续约 $duration 秒。" }
         Reset-UpstreamHealthState
-        if ($wasNotified) { Show-MonitorNotification -Event ([pscustomobject]@{ Title='代理线路已恢复'; Text="代理联网已恢复，之前的故障持续约 $duration 秒。"; Icon='Info' }) }
+        if ($wasNotified) { Show-MonitorNotification -Event ([pscustomobject]@{ Title='网络连接已恢复'; Text=$recoveryText; Icon='Info' }) }
         Set-TrayAppearance -State $State
     }
 }
@@ -1558,7 +1651,7 @@ function Invoke-MonitorSelfTest {
         systemProxyServer = '127.0.0.1:7890'; systemProxyOwner = 'Clash Verge'; systemProxyOwnerId = 'clash_verge'; tunOwners = @()
         tunOwnerIds = @(); systemProxyIsLocal = $true; staleSystemProxy = $false; conflictCount = 0; conflicts = @(); coreClients = @('Clash Verge'); proxyGuardClients = @(); warningCount = 0
         diagnosisCode='HealthySingleOwner'; diagnosisTitle='代理接管正常'; diagnosisMessage='正常'; diagnosisAction='无需操作'; diagnosisOwnerIds=@('clash_verge'); diagnosisFindings=@()
-        directStatus='Healthy'; directHealthy=$true; proxyStatus='Healthy'; proxyHealthy=$true; proxyFailureCandidate=$false; dnsStatus='Healthy'; portOwners=@(); environmentProxies=@()
+        directStatus='Healthy'; directHealthy=$true; proxyStatus='Healthy'; proxyHealthy=$true; proxyFailureCandidate=$false; environmentProxyStatus='NotTested'; environmentProxyHealthy=$false; environmentProxyEndpoint=''; environmentProxyFailureCandidate=$false; dnsStatus='Healthy'; portOwners=@(); environmentProxies=@()
     }
     $conflict = [pscustomobject]@{
         observedAt = (Get-Date).ToString('o'); effectiveOwner = '多 Owner 冲突：Clash Verge、龙猫云 Lite'; systemProxyEnabled = $true
@@ -1567,7 +1660,7 @@ function Invoke-MonitorSelfTest {
         systemProxyIsLocal = $true; staleSystemProxy = $false; conflictCount = 1; conflicts = @('高风险|系统代理/TUN|系统代理属于 Clash Verge，TUN 属于龙猫云 Lite。')
         coreClients = @('Clash Verge', '龙猫云 Lite'); proxyGuardClients = @(); warningCount = 0
         diagnosisCode='MultiOwnerConflict'; diagnosisTitle='多个代理客户端正在同时接管'; diagnosisMessage='冲突'; diagnosisAction='安全切换'; diagnosisOwnerIds=@('clash_verge','longmao'); diagnosisFindings=@([pscustomobject]@{code='TunResidual';severity='高风险';message='测试';action='测试'})
-        directStatus='Healthy'; directHealthy=$true; proxyStatus='Healthy'; proxyHealthy=$true; proxyFailureCandidate=$false; dnsStatus='Healthy'; portOwners=@(); environmentProxies=@()
+        directStatus='Healthy'; directHealthy=$true; proxyStatus='Healthy'; proxyHealthy=$true; proxyFailureCandidate=$false; environmentProxyStatus='NotTested'; environmentProxyHealthy=$false; environmentProxyEndpoint=''; environmentProxyFailureCandidate=$false; dnsStatus='Healthy'; portOwners=@(); environmentProxies=@()
     }
     $healthyStatusModel = Get-NetworkStatusDialogModel -State $base
     if ($healthyStatusModel.HasRisk -or $healthyStatusModel.CloseButtonText -ne '关闭') { throw '无冲突状态窗口仍显示修复入口。' }
@@ -1730,52 +1823,25 @@ Start-Sleep -Milliseconds 1500
     Update-UpstreamHealth -State $base
     Update-UpstreamHealth -State $base
     if ($null -ne $Script:UpstreamFailureSince) { throw '线路恢复双采样逻辑错误。' }
-        Write-Host '监控自检通过：客户端状态文案、冲突解决入口、文件锁重试、日志轮转、点击异常隔离、状态指纹、冲突分类、防抖、误关系统代理恢复边界、慢网络 UI 心跳、非阻塞自动急救和线路分级提醒逻辑正常。' -ForegroundColor Green
+    $applicationProxy = $base.PSObject.Copy()
+    $applicationProxy.environmentProxyFailureCandidate = $true
+    $applicationProxy.environmentProxyHealthy = $false
+    $applicationProxy.environmentProxyEndpoint = '127.0.0.1:7892'
+    Reset-UpstreamHealthState
+    $Script:UpstreamFailureSince = (Get-Date).AddSeconds(-61)
+    Update-UpstreamHealth -State $applicationProxy
+    if ($Script:UpstreamFailureType -ne 'ApplicationProxy' -or -not $Script:UpstreamEventStarted) { throw '应用代理断连分类逻辑错误。' }
+    $tunFailure = $base.PSObject.Copy()
+    $tunFailure.directStatus = 'Failed'
+    $tunFailure.directHealthy = $false
+    $tunFailure.tunOwnerIds = @('clash_verge')
+    Reset-UpstreamHealthState
+    $Script:UpstreamFailureSince = (Get-Date).AddSeconds(-61)
+    Update-UpstreamHealth -State $tunFailure
+    if ($Script:UpstreamFailureType -ne 'TunOrLocal' -or -not $Script:UpstreamEventStarted -or $Script:UpstreamActionAvailable) { throw 'TUN 或本地网络断连分类逻辑错误。' }
+    Write-Host '监控自检通过：客户端状态文案、冲突解决入口、文件锁重试、日志轮转、点击异常隔离、状态指纹、冲突分类、防抖、误关系统代理恢复边界、慢网络 UI 心跳、系统代理、应用代理、TUN/普通网络的连接监控逻辑正常。' -ForegroundColor Green
     }
     finally { $Script:TestMode = $false }
-}
-
-function Get-LongmaoConnectionMonitorProcesses {
-    if (-not (Test-Path -LiteralPath $Script:LongmaoConnectionMonitorPath)) { return @() }
-    $escapedPath = [regex]::Escape($Script:LongmaoConnectionMonitorPath)
-    return @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { [string]$_.CommandLine -match $escapedPath })
-}
-
-function Test-LongmaoCoreRunning {
-    return @(
-        Get-Process -Name 'lmclientCore' -ErrorAction SilentlyContinue
-    ).Count -gt 0
-}
-
-function Start-LongmaoConnectionMonitorIfNeeded {
-    # 只有检测到龙猫云核心时才启动，避免未使用龙猫云的用户产生无意义的断连记录。
-    if (-not (Test-LongmaoCoreRunning)) { return }
-    if (@(Get-LongmaoConnectionMonitorProcesses).Count -gt 0) { return }
-    if (Test-Path -LiteralPath $Script:LongmaoConnectionStopFlagPath) {
-        Remove-Item -LiteralPath $Script:LongmaoConnectionStopFlagPath -Force -ErrorAction SilentlyContinue
-    }
-    Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($Script:LongmaoConnectionMonitorPath)`"" -WindowStyle Hidden
-    Write-MonitorLog -Level 'INFO' -Message '检测到龙猫云核心，已自动启动断连监控。'
-}
-
-function Stop-LongmaoConnectionMonitor {
-    $running = @(Get-LongmaoConnectionMonitorProcesses)
-    if ($running.Count -eq 0) { return }
-    if (-not (Test-Path -LiteralPath $Script:LongmaoConnectionDataDirectory)) {
-        New-Item -ItemType Directory -Path $Script:LongmaoConnectionDataDirectory -Force | Out-Null
-    }
-    Set-Content -LiteralPath $Script:LongmaoConnectionStopFlagPath -Value (Get-Date -Format 'o') -Encoding UTF8
-    $deadline = (Get-Date).AddSeconds(8)
-    do {
-        Start-Sleep -Milliseconds 250
-        $running = @(Get-LongmaoConnectionMonitorProcesses)
-    } while ($running.Count -gt 0 -and (Get-Date) -lt $deadline)
-    if ($running.Count -gt 0) {
-        foreach ($process in $running) {
-            Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction SilentlyContinue
-        }
-    }
 }
 
 function Start-TrayMonitor {
@@ -1791,7 +1857,6 @@ function Start-TrayMonitor {
 
     try {
         if (Test-Path -LiteralPath $Script:StopFlagPath) { Remove-Item -LiteralPath $Script:StopFlagPath -Force }
-        Start-LongmaoConnectionMonitorIfNeeded
         $context = New-Object System.Windows.Forms.ApplicationContext
         $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
         $Script:NotifyIcon = $notifyIcon
@@ -1874,7 +1939,7 @@ function Start-TrayMonitor {
         })
         $exitItem.add_Click({
             Invoke-TrayActionSafely -ActionName '退出断网急救' -Action {
-                if (Confirm-RepairAction '退出断网急救' '退出后将停止本次后台检查、断网自动恢复和龙猫云断连监控；下次登录 Windows 时仍会按开机启动设置运行。是否退出？') {
+                if (Confirm-RepairAction '退出断网急救' '退出后将停止本次后台检查和断网自动恢复；下次登录 Windows 时仍会按开机启动设置运行。是否退出？') {
                     $notifyIcon.Visible = $false
                     $context.ExitThread()
                 }
@@ -1894,7 +1959,6 @@ function Start-TrayMonitor {
             try {
                 [void](Complete-AsyncMonitorScan)
                 if ($null -eq $Script:AsyncScan -and (Get-Date) -ge $Script:NextFullScanAt) {
-                    Start-LongmaoConnectionMonitorIfNeeded
                     Start-AsyncMonitorScan
                     $Script:NextFullScanAt = (Get-Date).AddSeconds($IntervalSeconds)
                 }
@@ -1939,7 +2003,6 @@ function Start-TrayMonitor {
         $notifyIcon.Dispose()
     }
     finally {
-        Stop-LongmaoConnectionMonitor
         $Script:NotifyIcon = $null
         try { $mutex.ReleaseMutex() } catch {}
         $mutex.Dispose()
